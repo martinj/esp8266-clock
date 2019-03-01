@@ -1,4 +1,4 @@
-#define BLYNK_PRINT Serial
+//#define BLYNK_PRINT Serial
 
 #include <SPI.h>
 #include <Adafruit_NeoPixel.h>
@@ -8,18 +8,36 @@
 #include <TimeLib.h>
 #include <WidgetRTC.h>
 #include <ArduinoJson.h>
+#include <ESP8266mDNS.h>
+#include <WiFiUdp.h>
+#include <ArduinoOTA.h>
+#include <Adafruit_Sensor.h>
+#include <DHT.h>
+#include <DHT_U.h>
 
-#define DEBUG_SERIAL
+// #define DEBUG_SERIAL
+
+// MDNS name, used for ArduinoOTA
+#define DEVICE_NAME "clock"
 
 // WIFI & Blynk
 char auth[] = "BLYNK_API_KEY";
 char ssid[] = "SSID";
 char pass[] = "SSID_PASSWORD";
 
+// Temp sensor
+#define DHT_PIN 0
+#define DHT_TYPE DHT11
+DHT_Unified dht(DHT_PIN, DHT_TYPE);
+unsigned long sensorReadingDelayMs;
+unsigned long lastSensorReadingMs;
+int currentSensorTemp;
+int currentSensorHum;
+
 // Weather
 #define WEATHER_API_KEY "OPEN_WEATHER_API_KEY"
-#define WEATHER_CITY_COUNTRY "Gothenburg,se"
-#define WEATHER_DISPLAY_TIME 60000 // in ms
+String weatherCityCountry = "Gothenburg,se";
+unsigned int weatherDisplayTimeMs = 60000;
 
 // Neo Pixel
 #define LED_PIN 2
@@ -51,7 +69,7 @@ unsigned long weatherStartMs = 0;
 // Modes
 #define CLOCK 1
 #define WEATHER 2
-#define MODE_CYCLE_TIME 600000 // in ms
+unsigned int cycleTimeMs = 600000;
 unsigned long lastModeChange = 0;
 int selectedMode = CLOCK;
 
@@ -62,6 +80,11 @@ int selectedMode = CLOCK;
 #define P_MODE V3
 #define P_COLOR_STORAGE V4
 #define P_OUT_TEMP V5
+#define P_SENSOR_TEMP V6
+#define P_SENSOR_HUM V7
+#define P_OPENWEATHER_Q V8
+#define P_CYCLE_TIME V9
+#define P_WEATHER_DISPLAY_TIME V10
 
 int selectedColorItem = 6;
 
@@ -74,7 +97,39 @@ uint32_t colorFromHex(char *hex);
 BLYNK_CONNECTED() {
   // Synchronize time on connection
   rtc.begin();
-  Blynk.syncVirtual(P_BRIGHTNESS, P_MODE, P_COLOR_STORAGE, P_COLOR_SELECT);
+  Blynk.syncVirtual(P_BRIGHTNESS, P_MODE, P_COLOR_STORAGE, P_COLOR_SELECT, P_CYCLE_TIME, P_WEATHER_DISPLAY_TIME, P_OPENWEATHER_Q);
+}
+
+BLYNK_WRITE(P_OPENWEATHER_Q) {
+  String query = param.asString();
+  if (query.length() == 0) {
+    Blynk.virtualWrite(P_OPENWEATHER_Q, weatherCityCountry);
+    return;
+  }
+
+  // force refresh
+  lastWeatherFetchMs = 0;
+  weatherCityCountry = query;
+}
+
+BLYNK_WRITE(P_CYCLE_TIME) {
+  int min = param.asInt();
+  if (min == 0) {
+    Blynk.virtualWrite(P_CYCLE_TIME, cycleTimeMs / 60000);
+    return;
+  }
+
+  cycleTimeMs = min * 60000;
+}
+
+BLYNK_WRITE(P_WEATHER_DISPLAY_TIME) {
+  int min = param.asInt();
+  if (min == 0) {
+    Blynk.virtualWrite(P_WEATHER_DISPLAY_TIME, weatherDisplayTimeMs / 60000);
+    return;
+  }
+
+  weatherDisplayTimeMs = min * 60000;
 }
 
 BLYNK_WRITE(P_BRIGHTNESS) {
@@ -254,7 +309,7 @@ void updateWeather() {
   lastWeatherFetchMs = now;
 
   HTTPClient http;
-  String url = "http://api.openweathermap.org/data/2.5/weather?q=" + (String) WEATHER_CITY_COUNTRY + "&APPID=" + (String) WEATHER_API_KEY + "&mode=json&units=metric";
+  String url = "http://api.openweathermap.org/data/2.5/weather?q=" + (String) weatherCityCountry + "&APPID=" + (String) WEATHER_API_KEY + "&mode=json&units=metric";
   http.begin(url);
   int httpCode = http.GET();
 
@@ -274,8 +329,36 @@ void updateWeather() {
   http.end();
 }
 
+void updateTemperature() {
+  unsigned long now = millis();
+  if (!isnan(lastSensorReadingMs) && (now - lastSensorReadingMs) < sensorReadingDelayMs) {
+    return;
+  }
+  lastSensorReadingMs = now;
+
+  sensors_event_t tempEvt, humEvt;
+  dht.temperature().getEvent(&tempEvt);
+  dht.humidity().getEvent(&humEvt);
+  if (isnan(tempEvt.temperature) || isnan(humEvt.temperature)) {
+    #ifdef DEBUG_SERIAL
+      Serial.println("Error reading temperature/humidity from sensor!");
+    #endif
+    return;
+  }
+
+  currentSensorTemp = tempEvt.temperature;
+  currentSensorHum = humEvt.relative_humidity;
+  #ifdef DEBUG_SERIAL
+    Serial.printf("Sensor temp: %d, humidity: %d\n", currentSensorTemp, currentSensorHum);
+  #endif
+}
+
+void writeTemperature() {
+  Blynk.virtualWrite(P_SENSOR_TEMP, currentSensorTemp);
+  Blynk.virtualWrite(P_SENSOR_HUM, currentSensorHum);
+}
+
 void showWeather() {
-  updateWeather();
   if (degreeC == showingTemp) {
     return;
   }
@@ -328,26 +411,39 @@ void showWeather() {
 }
 
 void cycleMode() {
-  if (selectedMode == CLOCK && (millis() - lastModeChange) >= MODE_CYCLE_TIME) {
+  if (selectedMode == CLOCK && (millis() - lastModeChange) >= cycleTimeMs) {
     setMode(WEATHER); // weather will automatically switch back to clock after a while
   }
 }
 
 void setup() {
   Serial.begin(9600);
+  ArduinoOTA.setHostname(DEVICE_NAME);
+  ArduinoOTA.begin();
+
   Blynk.begin(auth, ssid, pass);
 
   setSyncInterval(10 * 60); // Sync interval for rtc clock in seconds (10 minutes)
 
+  dht.begin();
+  sensor_t sensor;
+  dht.temperature().getSensor(&sensor);
+  sensorReadingDelayMs = sensor.min_delay / 1000;
+
+  timer.setInterval(60000L, writeTemperature);
   timer.setInterval(10000L, refreshTime);
+
   pixels.begin();
   pixels.show();
 }
 
 void loop() {
+  ArduinoOTA.handle();
   Blynk.run();
   timer.run();
   cycleMode();
+  updateTemperature();
+  updateWeather();
 
   switch (selectedMode) {
     case CLOCK:
@@ -355,7 +451,7 @@ void loop() {
       break;
     case WEATHER:
       showWeather();
-      if ((millis() - weatherStartMs) >= WEATHER_DISPLAY_TIME) {
+      if ((millis() - weatherStartMs) >= weatherDisplayTimeMs) {
         setMode(CLOCK);
       }
       break;
