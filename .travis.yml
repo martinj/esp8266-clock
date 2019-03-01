@@ -10,7 +10,7 @@ cache:
 install:
     - pip install -U platformio
     - platformio update
-    - platformio lib install 28 64 415 44
+    - platformio lib install 28 64 415 44 31 19
 
 script:
     - platformio run
